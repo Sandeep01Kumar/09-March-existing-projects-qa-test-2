@@ -1,11 +1,11 @@
 # hao-backprop-test
 
-A simple Node.js HTTP server built with [Express.js](https://expressjs.com/) v5. This tutorial-style project demonstrates basic routing with two endpoints.
+A simple HTTP server built with [Flask](https://flask.palletsprojects.com/) (Python 3). This tutorial-style project demonstrates basic routing with two endpoints, rewritten from the original Node.js Express.js implementation.
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) >= 18 (required by Express.js v5)
-- npm (included with Node.js)
+- [Python](https://www.python.org/) >= 3.9
+- pip (included with Python)
 
 ## Setup
 
@@ -16,24 +16,26 @@ A simple Node.js HTTP server built with [Express.js](https://expressjs.com/) v5.
    cd hao-backprop-test
    ```
 
-2. Install dependencies:
+2. Create and activate a virtual environment (recommended):
 
    ```bash
-   npm install
+   python -m venv venv
+   source venv/bin/activate   # Linux / macOS
+   venv\Scripts\activate      # Windows
+   ```
+
+3. Install dependencies:
+
+   ```bash
+   pip install -r requirements.txt
    ```
 
 ## Running the Server
 
-Start the server using either of the following methods:
+Start the server:
 
 ```bash
-npm start
-```
-
-Or run the server script directly:
-
-```bash
-node server.js
+python app.py
 ```
 
 The server will start on **port 3000** and log the URL to the console:
@@ -44,10 +46,10 @@ Server running at http://localhost:3000/
 
 ## Available Endpoints
 
-| Method | Path       | Response         | Content-Type | Status |
-|--------|------------|------------------|--------------|--------|
+| Method | Path       | Response          | Content-Type | Status |
+|--------|------------|-------------------|--------------|--------|
 | GET    | `/`        | `Hello, World!\n` | text/plain   | 200    |
-| GET    | `/evening` | `Good evening`   | text/plain   | 200    |
+| GET    | `/evening` | `Good evening`    | text/plain   | 200    |
 
 ### Examples
 
@@ -67,5 +69,5 @@ curl http://localhost:3000/evening
 
 ## Technology Stack
 
-- **Node.js** — JavaScript runtime
-- **Express.js v5** — HTTP framework with routing and middleware support
+- **Python 3** — Programming language
+- **Flask** — Lightweight WSGI web framework with routing and request/response utilities
