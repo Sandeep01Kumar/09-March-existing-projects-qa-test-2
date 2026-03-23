@@ -1,14 +1,25 @@
-const http = require('http');
+const express = require('express');
+const app = express();
 
-const hostname = '127.0.0.1';
-const port = 3000;
+// Disable X-Powered-By header to prevent server technology disclosure
+app.disable('x-powered-by');
 
-const server = http.createServer((req, res) => {
-  res.statusCode = 200;
-  res.setHeader('Content-Type', 'text/plain');
-  res.end('Hello, World!\n');
+// Set security headers on all responses to prevent MIME type sniffing
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  next();
 });
 
-server.listen(port, hostname, () => {
-  console.log(`Server running at http://${hostname}:${port}/`);
+const port = 3000;
+
+app.get('/', (req, res) => {
+  res.type('text/plain').send('Hello, World!\n');
+});
+
+app.get('/evening', (req, res) => {
+  res.type('text/plain').send('Good evening');
+});
+
+app.listen(port, () => {
+  console.log(`Server running at http://localhost:${port}/`);
 });
