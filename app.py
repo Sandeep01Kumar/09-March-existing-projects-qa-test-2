@@ -1,12 +1,12 @@
 """
-Flask HTTP Server — functionally identical replacement for the Node.js server.js.
+Flask HTTP Server — functionally identical replacement for the original HTTP server.
 
 This module implements a minimal Flask application that responds to every inbound
 HTTP request (regardless of method, path, headers, or payload) with an HTTP 200 OK
 status, a Content-Type: text/plain header, and the exact body "Hello, World!\n".
 
 The server binds exclusively to the loopback address 127.0.0.1 on port 3000,
-preserving network binding parity with the original Node.js implementation.
+preserving network binding parity with the original implementation.
 
 Usage:
     python app.py
@@ -14,11 +14,11 @@ Usage:
 
 from flask import Flask, Response
 
-# Flask application instance — replaces Node.js http.createServer()
+# Flask application instance — replaces the original HTTP server factory
 app = Flask(__name__)
 
 # Network binding constants — PEP 8 naming convention for module-level constants
-# These mirror the hardcoded values from the original server.js (lines 3-4)
+# These mirror the hardcoded values from the original server implementation
 HOSTNAME = '127.0.0.1'
 PORT = 3000
 
@@ -29,8 +29,8 @@ def catch_all(path):
     """
     Catch-all route handler that responds identically to every HTTP request.
 
-    This handler replicates the behavior of the Node.js http.createServer() callback
-    in server.js (lines 6-9), which ignores the request object entirely and always
+    This handler replicates the behavior of the original HTTP server's request handler
+    callback, which ignores the request object entirely and always
     returns the same response: status 200, Content-Type text/plain, body "Hello, World!\n".
 
     The dual-decorator pattern ensures both the root path '/' and all sub-paths
@@ -39,7 +39,7 @@ def catch_all(path):
 
     Args:
         path: The URL path captured by the route. This parameter is accepted but
-              intentionally ignored to mirror the Node.js behavior where the req
+              intentionally ignored to mirror the original server behavior where the request
               object is never read.
 
     Returns:
@@ -51,8 +51,8 @@ def catch_all(path):
 
 if __name__ == '__main__':
     # Print startup message to stdout before starting the server,
-    # replicating the Node.js console.log() in server.js (lines 12-14)
+    # replicating the original server's startup console logging
     print(f'Server running at http://{HOSTNAME}:{PORT}/')
     # Start the Flask development server on the loopback address,
-    # equivalent to server.listen(port, hostname, callback) in Node.js
+    # equivalent to the original server's listen binding
     app.run(host=HOSTNAME, port=PORT)
