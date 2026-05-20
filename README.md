@@ -131,7 +131,7 @@ Expected output: a 14-byte body terminating with `0x0A` (the trailing newline). 
 │   ├── index.js              # Centralized configuration loader (reads process.env)
 │   └── logger.js             # Winston logger factory (JSON format, file transports)
 ├── middleware/
-│   ├── requestLogger.js      # Morgan HTTP request logger piped into Winston
+│   ├── requestLogger.js      # Morgan HTTP request logger streamed into Winston
 │   ├── errorHandler.js       # Four-argument Express error handler
 │   └── notFoundHandler.js    # 404 handler for unmatched paths
 ├── routes/
