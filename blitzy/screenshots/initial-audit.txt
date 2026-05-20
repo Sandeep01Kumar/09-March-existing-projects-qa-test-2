@@ -1,0 +1,16 @@
+# npm audit report
+
+ws  8.0.0 - 8.20.0
+Severity: moderate
+ws: Uninitialized memory disclosure - https://github.com/advisories/GHSA-58qx-3vcg-4xpx
+fix available via `npm audit fix --force`
+Will install pm2@6.0.14, which is a breaking change
+node_modules/ws
+  pm2  >=7.0.0
+  Depends on vulnerable versions of ws
+  node_modules/pm2
+
+2 moderate severity vulnerabilities
+
+To address all issues (including breaking changes), run:
+  npm audit fix --force
