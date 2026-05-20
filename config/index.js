@@ -49,17 +49,114 @@
  *                            ensures this resolves to the project root
  *                            regardless of where `pm2 start` is invoked
  *
- * Operator (Logical OR) vs Nullish Coalescing:
- *   This module uses `||` (logical OR) rather than `??` (nullish coalescing)
- *   for defaults. Rationale: `||` treats empty strings (`''`), `0`, and
- *   `NaN` as fallback triggers — which is the desired behavior here. For
- *   example, if an operator sets `PORT=` (empty value) or `PORT=0`, we want
- *   to fall back to the default 3000 rather than honor the broken setting.
- *   `??` would only trigger on `null`/`undefined`, allowing these invalid
- *   values to pass through.
+ * Operator (Logical OR) vs Nullish Coalescing for string fields:
+ *   For `host`, `nodeEnv`, `logLevel`, and `logDir`, this module uses
+ *   `||` (logical OR) rather than `??` (nullish coalescing) for defaults.
+ *   Rationale: `||` treats empty strings (`''`) as fallback triggers, which
+ *   is the desired behavior here (`HOST=` should fall back to '127.0.0.1',
+ *   not pass an empty string through to `app.listen`). `??` would only
+ *   trigger on `null`/`undefined`, allowing these invalid values to pass
+ *   through.
+ *
+ * PORT — fail-safe validation:
+ *   `config.port` does NOT use simple `||` because that pattern only
+ *   guards against falsy values (NaN, 0). An operator could still set
+ *   `PORT=99999`, `PORT=-1`, or `PORT=3.14` — all of which `Number(...)`
+ *   coerces to a truthy but invalid value. To honor AAP §0.6.2 "safe
+ *   defaults / basic validation" and the fail-safe configuration
+ *   requirement, PORT is parsed by the `parsePort(...)` helper below, which
+ *   validates the integer range [1, 65535] and falls back to the default
+ *   3000 (with a `console.warn`) for any value outside that range. This
+ *   guarantees downstream consumers can rely on `config.port` always being
+ *   a valid TCP port number.
  */
 
 'use strict';
+
+// -----------------------------------------------------------------------------
+// Default values (single source of truth)
+// -----------------------------------------------------------------------------
+//
+// Centralizing the defaults at the top of the module makes them auditable
+// at a glance and prevents subtle drift between the validation helper and
+// the configuration object construction below.
+
+const DEFAULT_PORT = 3000;
+const DEFAULT_HOST = '127.0.0.1';
+const DEFAULT_NODE_ENV = 'development';
+const DEFAULT_LOG_LEVEL = 'info';
+const DEFAULT_LOG_DIR = './logs';
+
+// Valid TCP/UDP port range per IANA / RFC 6335.
+const MIN_PORT = 1;
+const MAX_PORT = 65535;
+
+// -----------------------------------------------------------------------------
+// Fail-safe PORT parser
+// -----------------------------------------------------------------------------
+//
+// `process.env.*` values are always strings (or `undefined` when unset).
+// We must:
+//   1. Treat unset / empty values as "use the default" silently (this is
+//      the normal local-development case and emitting a warning would be
+//      noisy).
+//   2. Coerce numeric strings to a Number and validate that the result is
+//      an integer within the valid TCP port range [1, 65535].
+//   3. For any other value (non-numeric, NaN, fractional, negative,
+//      zero, above 65535, etc.) emit a `console.warn` and fall back to
+//      the default port. Falling back rather than letting `app.listen()`
+//      reject the value (or worse, silently mis-bind) honors the AAP
+//      §0.6.2 "safe defaults / basic validation" requirement and the
+//      Checkpoint 1 fail-safe configuration requirement.
+//
+// Why `console.warn` and not `winston.warn`:
+//   `config/logger.js` depends on this module (it reads `config.logDir`,
+//   `config.logLevel`, `config.nodeEnv`). Calling winston from here would
+//   create a circular load-order dependency. `console.warn` writes to
+//   stderr immediately and is captured by PM2's `error_file`.
+//
+// Examples of accepted vs. rejected values:
+//   PORT unset   -> returns DEFAULT_PORT silently
+//   PORT=''      -> returns DEFAULT_PORT silently (operator left it blank)
+//   PORT='3000'  -> returns 3000
+//   PORT='1'     -> returns 1 (minimum valid port)
+//   PORT='65535' -> returns 65535 (maximum valid port)
+//   PORT='abc'   -> warns, returns DEFAULT_PORT (Number('abc') is NaN)
+//   PORT='0'     -> warns, returns DEFAULT_PORT (port 0 is reserved)
+//   PORT='-1'    -> warns, returns DEFAULT_PORT (negative)
+//   PORT='99999' -> warns, returns DEFAULT_PORT (exceeds MAX_PORT)
+//   PORT='3.14'  -> warns, returns DEFAULT_PORT (not an integer)
+
+function parsePort(rawValue, defaultPort) {
+  if (rawValue === undefined || rawValue === '') {
+    return defaultPort;
+  }
+  const parsed = Number(rawValue);
+  // `Number.isInteger` correctly rejects NaN, Infinity, and fractional
+  // values like 3.14. The explicit range check rejects 0, negative numbers,
+  // and values above the TCP port maximum.
+  if (
+    Number.isInteger(parsed) &&
+    parsed >= MIN_PORT &&
+    parsed <= MAX_PORT
+  ) {
+    return parsed;
+  }
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[config] Invalid PORT value (' +
+      String(rawValue) +
+      '); valid range is ' +
+      String(MIN_PORT) +
+      '-' +
+      String(MAX_PORT) +
+      ' (integer). ' +
+      'Falling back to default port=' +
+      String(defaultPort) +
+      '. Set a valid integer port in the environment and restart.'
+  );
+  return defaultPort;
+}
 
 // -----------------------------------------------------------------------------
 // Configuration object construction
@@ -67,34 +164,34 @@
 //
 // Each property reads its corresponding `process.env.*` variable and falls
 // back to the safe default when the variable is missing, empty, or invalid.
-// `Number(process.env.PORT)` returns NaN for non-numeric values, which is
-// falsy, so the `|| 3000` fallback correctly handles cases like
-// `PORT=abc`, `PORT=`, and unset PORT.
+// PORT goes through the dedicated `parsePort` helper above so that invalid
+// truthy values (e.g., 99999, -1, 3.14) are rejected and replaced with the
+// safe default rather than being exported to downstream consumers.
 
 const config = {
   // Network interface to bind the HTTP listener to. Defaults to the loopback
   // address to preserve the security posture of the original Flask
   // implementation (app.py:L22). Operators may override via the HOST env var
   // (e.g., HOST=0.0.0.0 to expose on all interfaces).
-  host: process.env.HOST || '127.0.0.1',
+  host: process.env.HOST || DEFAULT_HOST,
 
-  // TCP port to listen on. Coerced from string to number because
-  // `process.env.*` values are always strings. Downstream consumers
-  // (e.g., `app.listen(config.port, ...)`) expect a numeric port per the
-  // documented config object contract.
-  port: Number(process.env.PORT) || 3000,
+  // TCP port to listen on. Coerced from string to number and validated via
+  // `parsePort(...)`. Invalid values trigger a `console.warn` and fall back
+  // to DEFAULT_PORT (3000), so downstream consumers can rely on `config.port`
+  // always being a finite positive integer in the valid TCP port range.
+  port: parsePort(process.env.PORT, DEFAULT_PORT),
 
   // Runtime mode: 'development' | 'production' | 'test'. Used by
   // `config/logger.js` to gate file transports, by `server.js` to gate the
   // `trust proxy` setting, and by `middleware/errorHandler.js` to suppress
   // stack traces in production responses (per AAP §0.8.2).
-  nodeEnv: process.env.NODE_ENV || 'development',
+  nodeEnv: process.env.NODE_ENV || DEFAULT_NODE_ENV,
 
   // Winston severity threshold:
   //   error < warn < info < http < verbose < debug < silly
   // Logs at or above this level are emitted; lower-priority logs are
   // dropped. Development typically uses 'debug'; production uses 'info'.
-  logLevel: process.env.LOG_LEVEL || 'info',
+  logLevel: process.env.LOG_LEVEL || DEFAULT_LOG_LEVEL,
 
   // Directory where log files are written. Relative paths resolve against
   // `process.cwd()`. PM2's `cwd: __dirname` (see `ecosystem.config.js`)
@@ -102,43 +199,8 @@ const config = {
   // where `pm2 start` was invoked from. `config/logger.js` is responsible
   // for ensuring this directory exists at startup (winston's File transport
   // does not create directories automatically — see AAP §0.5.3).
-  logDir: process.env.LOG_DIR || './logs'
+  logDir: process.env.LOG_DIR || DEFAULT_LOG_DIR
 };
-
-// -----------------------------------------------------------------------------
-// Defensive port-range validation
-// -----------------------------------------------------------------------------
-//
-// The `|| 3000` fallback above already handles falsy values (`NaN`, `0`,
-// missing env var). However, an operator could still set a value that
-// successfully parses as a non-zero number but falls outside the valid
-// TCP port range, e.g.:
-//
-//   PORT=99999  -> Number(...) === 99999, which is truthy, so it bypasses
-//                  the `|| 3000` fallback even though it's an invalid port.
-//   PORT=-1     -> Number(...) === -1, also truthy, also invalid.
-//   PORT=3.14   -> Number(...) === 3.14, truthy, but not an integer.
-//
-// In such cases, we emit a `console.warn` (winston is not yet initialized
-// at this load-order stage, since `config/logger.js` depends on this module)
-// to surface the misconfiguration without throwing. The application will
-// still start with the invalid value, which `app.listen()` will then either
-// reject with a clearer error or silently coerce — either way, the operator
-// sees the warning in the stderr stream and can correct the env var and
-// restart.
-
-if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) {
-  // eslint-disable-next-line no-console
-  console.warn(
-    '[config] Invalid PORT value (' +
-      String(process.env.PORT) +
-      '); valid range is 1-65535. ' +
-      'Continuing with port=' +
-      String(config.port) +
-      ', but `app.listen()` may reject this value. ' +
-      'Set a valid integer port in the environment and restart.'
-  );
-}
 
 // -----------------------------------------------------------------------------
 // Freeze and export
