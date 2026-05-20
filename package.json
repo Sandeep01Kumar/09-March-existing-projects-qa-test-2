@@ -1,7 +1,7 @@
 {
   "name": "hao-backprop-test",
   "version": "1.0.0",
-  "description": "Minimal Express.js HTTP server for Backprop integration testing. Responds to every HTTP method and every path with `Hello, World!\\n` (text/plain, status 200). Production-ready via PM2 cluster-mode deployment.",
+  "description": "Hello World HTTP server built with Express.js 5.2.1; configured for production deployment with PM2.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -9,8 +9,7 @@
     "pm2:start": "pm2 start ecosystem.config.js --env production",
     "pm2:reload": "pm2 reload ecosystem.config.js --env production",
     "pm2:stop": "pm2 stop ecosystem.config.js",
-    "pm2:logs": "pm2 logs hao-backprop-test",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "pm2:logs": "pm2 logs hao-backprop-test"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -27,5 +26,6 @@
   "devDependencies": {
     "nodemon": "^3.1.0"
   },
-  "license": "ISC"
+  "license": "MIT",
+  "private": true
 }
