@@ -26,6 +26,11 @@
   "devDependencies": {
     "nodemon": "^3.1.0"
   },
+  "overrides": {
+    "pm2": {
+      "ws": "8.20.1"
+    }
+  },
   "license": "MIT",
   "private": true
 }
