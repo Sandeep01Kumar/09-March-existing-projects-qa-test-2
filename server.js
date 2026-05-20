@@ -27,13 +27,21 @@
  *      derivation works correctly behind a reverse proxy).
  *   5. Register middleware in the canonical Express ordering:
  *        helmet -> compression -> express.json -> express.urlencoded
- *        -> requestLogger -> routes -> notFoundHandler -> errorHandler
+ *        -> bodyParserErrorHandler -> requestLogger -> routes
+ *        -> notFoundHandler -> errorHandler
+ *      The `bodyParserErrorHandler` shim sits immediately after the body
+ *      parsers to translate parser failures into the byte-exact
+ *      `Hello, World!\n` response required by AAP Rule R-001 (per the
+ *      Checkpoint 2 FINAL code-review CRITICAL finding).
  *   6. Bind the HTTP listener to `config.host:config.port`.
  *   7. Emit the PM2 `ready` signal (gated on `process.send` so direct `node`
  *      execution does not crash).
  *   8. Register `SIGINT` and `SIGTERM` handlers for graceful shutdown.
  *   9. Register `uncaughtException` / `unhandledRejection` safety nets that
- *      log the failure and trigger the same graceful shutdown sequence.
+ *      log the failure and trigger the graceful shutdown sequence with a
+ *      NON-ZERO exit code, so PM2 and other process supervisors correctly
+ *      classify the termination as a crash rather than a planned stop
+ *      (per the Checkpoint 2 FINAL MAJOR code-review finding).
  *
  * Critical Rules (per the agent prompt's Phase 10 and AAP Rules R-001..R-012):
  *   - `require('dotenv').config()` MUST be the first statement.
@@ -61,15 +69,20 @@
  *
  * Graceful Shutdown Contract (per AAP §0.5.3, Rule R-010):
  *   PM2 sends SIGINT to workers on `pm2 stop`, and SIGTERM on `pm2 reload`
- *   (zero-downtime restart). Both signals MUST trigger the same shutdown
- *   sequence:
+ *   (zero-downtime restart). Both signals trigger the shutdown sequence
+ *   with an exit code argument of 0 (intentional). The fatal-process
+ *   handlers (`uncaughtException`, `unhandledRejection`) trigger the same
+ *   sequence but pass an exit code of 1 so PM2 sees a crash:
  *     1. Set the `isShuttingDown` re-entry guard so duplicate signals don't
  *        cause double-close errors.
- *     2. Log the signal at `info` severity.
+ *     2. Log the signal/origin at `info` (intentional) or `error` (fatal)
+ *        severity.
  *     3. Call `server.close(cb)` which stops accepting new connections and
  *        invokes the callback once all in-flight requests have drained.
- *     4. Exit with code 0 on clean drain, or code 1 if `close` callback
- *        receives an error or the drain timeout (10 s) is exceeded.
+ *     4. Exit with the supplied code (0 for SIGINT/SIGTERM, 1 for fatal
+ *        exceptions/rejections) on clean drain, or code 1 if `close`
+ *        callback receives an error, or `Math.max(suppliedCode, 1)` if the
+ *        drain timeout (10 s) is exceeded.
  *
  *   The 10-second drain timeout exceeds PM2's default `kill_timeout: 5000`
  *   ms so that PM2's SIGKILL (sent after `kill_timeout`) is the dominant
@@ -189,6 +202,15 @@ const compression = require('compression');
 //   - `./middleware/errorHandler`     -> 4-arg Express error middleware
 //                                          (function) [length === 4 ->
 //                                          error-handling middleware]
+//   - `./middleware/bodyParserErrorHandler` -> 4-arg Express error middleware
+//                                          (function) [length === 4 ->
+//                                          error-handling middleware];
+//                                          intercepts body-parser failures
+//                                          (err.type matches body-parser
+//                                          enumeration) and rewrites them
+//                                          to the byte-exact R-001 200
+//                                          response. Other errors fall
+//                                          through to errorHandler.
 //   - `./routes`                      -> express.Router() with the catch-all
 //                                          handler that preserves the
 //                                          byte-exact response contract
@@ -201,7 +223,8 @@ const compression = require('compression');
 //      `config.logLevel`, and `config.nodeEnv` to construct the winston
 //      transport list and to call `fs.mkdirSync(config.logDir, { recursive:
 //      true })` (per AAP Rule R-008).
-//   3. The three middleware modules evaluate; each imports the winston
+//   3. The four middleware modules evaluate (requestLogger, notFoundHandler,
+//      errorHandler, bodyParserErrorHandler); each imports the winston
 //      singleton from step 2 via Node's cached module reference.
 //   4. `./routes` evaluates last, also using the winston singleton.
 
@@ -210,6 +233,14 @@ const logger = require('./config/logger');
 const requestLogger = require('./middleware/requestLogger');
 const notFoundHandler = require('./middleware/notFoundHandler');
 const errorHandler = require('./middleware/errorHandler');
+// Body-parser compatibility shim — see middleware/bodyParserErrorHandler.js
+// for the full rationale. This 4-arg error-handling middleware is registered
+// immediately AFTER the body parsers and BEFORE requestLogger so that
+// body-parser failures (malformed JSON, oversized payloads, unsupported
+// charsets/encodings, etc.) are translated into the byte-exact HTTP 200
+// `Hello, World!\n` response per AAP Rule R-001. Non-body-parser errors
+// fall through to the main `errorHandler` for the normal JSON error path.
+const bodyParserErrorHandler = require('./middleware/bodyParserErrorHandler');
 const routes = require('./routes');
 
 // =============================================================================
@@ -332,9 +363,13 @@ app.use(compression());
 // The current catch-all route ignores `req.body` entirely (it sends the
 // same response regardless of input). The parsers are registered
 // defensively for future endpoints. Parser errors (malformed JSON,
-// oversized payloads) propagate via `next(err)` and surface in the
-// `errorHandler` at the end of the chain, where they receive a 400 or 413
-// response per the parser's `err.status` field.
+// oversized payloads, unsupported charsets/encodings, etc.) propagate
+// via `next(err)` with `err.type` set (e.g., 'entity.parse.failed',
+// 'entity.too.large', 'charset.unsupported'). These are then intercepted
+// by the `bodyParserErrorHandler` compatibility shim registered
+// IMMEDIATELY BELOW so they do not preempt the byte-exact response
+// contract required by AAP Rule R-001. See the bodyParserErrorHandler
+// header comment for the full rationale.
 //
 // Registration order rationale: body parsing happens BEFORE the request
 // logger so that `req.body` is available to any morgan token that wants
@@ -346,6 +381,54 @@ app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Stage 3b: Body-Parser Compatibility Shim (bodyParserErrorHandler)
+// ------------------------------------------------------------------
+// 4-arg error-handling middleware (`(err, req, res, next)` — fn.length===4)
+// that intercepts errors propagated by the body parsers registered
+// immediately above. When a body parser propagates an error whose
+// `err.type` matches the body-parser/raw-body error enumeration
+// ('entity.parse.failed', 'entity.too.large', 'charset.unsupported', etc.),
+// this shim emits the byte-exact HTTP 200 + `Content-Type: text/plain` +
+// `Hello, World!\n` response that AAP Rule R-001 requires of every inbound
+// request regardless of method, path, headers, or payload.
+//
+// Errors that are NOT body-parser failures (e.g., a route handler throws,
+// a downstream middleware fails) pass straight through this shim via
+// `next(err)` and surface in the main `errorHandler` at the end of the
+// chain, where they receive the JSON `{ "error": "Internal server error" }`
+// response with the propagated HTTP status. The discriminator is the
+// curated `err.type` set in `middleware/bodyParserErrorHandler.js` —
+// using `err.status` (e.g., 400/413/415) would risk false positives from
+// non-body-parser code paths.
+//
+// Registration order rationale: this shim MUST come immediately after
+// the body parsers so it is the FIRST 4-arg error-handling middleware
+// Express finds when scanning forward from the parser's `next(err)`
+// call. Express skips regular middleware (3-arg signatures like
+// `requestLogger`, `routes`, `notFoundHandler`) during that forward
+// scan, so position ahead of those modules is what matters; placing
+// this shim BEFORE or AFTER `requestLogger` would not change the
+// error-routing outcome for body-parser errors, but placing it
+// immediately after the parsers makes the source-code colocation of
+// "parser + parser-compatibility shim" obvious and audit-friendly.
+//
+// Note on morgan access-logging for masked requests: morgan's
+// `(req, res, next)` function never executes for body-parser-failed
+// requests (Express's error-scan skips all regular middleware). So
+// body-parser-failed requests are NOT recorded in the morgan access
+// log. Their observability lives in the `debug`-level entry emitted by
+// this shim — which is suppressed at the default production
+// `LOG_LEVEL=info` and visible in development at `LOG_LEVEL=debug`.
+//
+// Resolves the Checkpoint 2 (FINAL) CRITICAL code-review finding:
+// "express.json() and express.urlencoded({ extended: true }) are
+// registered before the catch-all route. These parsers can reject
+// malformed JSON/form/oversized bodies before routes/index.js runs, so
+// not every inbound request receives the required HTTP 200 + text/plain
+// + Hello, World!\\n response."
+
+app.use(bodyParserErrorHandler);
+
 // Stage 4: HTTP Request Logging (requestLogger / morgan)
 // -------------------------------------------------------
 // The `requestLogger` middleware imported above is the morgan instance
@@ -355,12 +438,18 @@ app.use(express.urlencoded({ extended: true }));
 // response completes.
 //
 // Registration order rationale: morgan must come AFTER the body parsers
-// (so it sees the finalized request) and BEFORE the routes (so EVERY
-// request is logged, including those that match the catch-all). Placing
-// morgan here means body-parser errors that propagate to errorHandler
-// are NOT logged by morgan (because their `finish` event fires inside
-// errorHandler's response — which is the desired behavior; errors are
-// logged by errorHandler itself at `error` severity).
+// and the body-parser compatibility shim (so it sees the finalized
+// request) and BEFORE the routes (so successful requests reach morgan's
+// regular-middleware pipeline normally). morgan is REGULAR middleware
+// (3-arg signature `(req, res, next)` -> fn.length===3), so when a body
+// parser calls `next(err)` Express skips morgan entirely while scanning
+// forward for the next 4-arg error handler — meaning body-parser-failed
+// requests are not access-logged by morgan; their observability lives in
+// the `debug`-level entry emitted by `bodyParserErrorHandler`. This
+// mirrors the original behavior where body-parser errors flowed to
+// `errorHandler` and were logged there at `error` severity; the shim
+// merely reclassifies the observability from `error` to `debug` because
+// the masked response is now part of the intended R-001 success path.
 
 app.use(requestLogger);
 
@@ -517,43 +606,73 @@ const server = app.listen(config.port, config.host, () => {
 // 7. Graceful Shutdown
 // =============================================================================
 //
-// Process signals supported (per AAP Rule R-010):
-//   - SIGINT  — sent by terminal Ctrl+C and by `pm2 stop` (default signal)
-//   - SIGTERM — sent by `pm2 reload`, `pm2 restart`, systemd's stop unit,
-//                Docker's container stop, and Kubernetes' pod termination
+// Termination origins supported (per AAP Rule R-010 and the Checkpoint 2
+// FINAL MAJOR code-review finding on fatal exit-code semantics):
+//
+//   INTENTIONAL signals (exit code 0 — clean drain):
+//     - SIGINT  — sent by terminal Ctrl+C and by `pm2 stop` (default signal)
+//     - SIGTERM — sent by `pm2 reload`, `pm2 restart`, systemd's stop unit,
+//                  Docker's container stop, and Kubernetes' pod termination
+//
+//   FATAL process failures (exit code 1 — drain then signal failure):
+//     - uncaughtException  — synchronous throw outside the Express
+//                              request/response error pipeline
+//     - unhandledRejection — Promise rejection without a `.catch`/`await`
+//                              upstream
+//
+// The exit code is operationally significant: PM2 and other process
+// supervisors use it to distinguish a planned stop (code 0) from a crash
+// (non-zero) when computing restart counts, alerting thresholds, and
+// status indicators. The Checkpoint 2 FINAL MAJOR finding noted that the
+// previous implementation called `gracefulShutdown(...)` from BOTH
+// signals and fatal handlers, and `gracefulShutdown` always exited with
+// code 0 on clean drain — making fatal failures look like intentional
+// stops to PM2. The fix is to thread an `exitCode` argument through
+// `gracefulShutdown` so signal handlers pass 0 and fatal handlers pass 1.
 //
 // Shutdown sequence:
 //   1. Set the `isShuttingDown` re-entry guard. If a second signal arrives
 //      (e.g., the operator hits Ctrl+C twice), we ignore it rather than
-//      attempt to close the server again.
-//   2. Log the signal at `info` severity so the operator and log
-//      aggregator can observe the shutdown initiation.
+//      attempt to close the server again. We also remember the
+//      `intendedExitCode` from the FIRST shutdown call so that the
+//      `setTimeout` drain-timeout safety net can honor it even if the
+//      drain takes longer than the `server.close` callback can finish.
+//   2. Log the signal/origin at the appropriate severity:
+//        - exitCode === 0 -> `info` (intentional, observed in dashboards)
+//        - exitCode !== 0 -> `error` (fatal, paged on-call)
 //   3. Call `server.close(cb)`:
 //        - Stops accepting NEW connections immediately.
 //        - Calls the callback once all in-flight connections have
 //          finished (or errors out if a connection is hung).
 //      Note: `server.close` does NOT forcibly terminate in-flight
-//      connections; it waits for them. For Node.js 18.2+, `server.closeAllConnections()`
-//      exists to force-close, but the AAP intentionally relies on PM2's
-//      `kill_timeout: 5000` as the force-kill mechanism (per the shutdown
-//      contract in the file header), so we don't call it here.
-//   4. On clean drain, log success and `process.exit(0)`.
+//      connections; it waits for them. For Node.js 18.2+,
+//      `server.closeAllConnections()` exists to force-close, but the AAP
+//      intentionally relies on PM2's `kill_timeout: 5000` as the
+//      force-kill mechanism (per the shutdown contract in the file
+//      header), so we don't call it here.
+//   4. On clean drain, log success and `process.exit(exitCode)` — i.e.,
+//      0 for intentional signals, 1 for fatal exceptions/rejections.
 //   5. On drain error, log the error with structured metadata and
-//      `process.exit(1)`.
+//      `process.exit(1)` REGARDLESS of the input exitCode — a drain
+//      error indicates a server-state failure, which is itself a
+//      non-zero situation.
 //   6. If drain takes longer than 10 seconds, the `setTimeout` safety net
-//      logs a forced-shutdown error and exits with code 1. The 10-second
-//      window is longer than PM2's default `kill_timeout: 5000` ms, so
-//      under PM2 management this safety net is rarely reached — PM2's
-//      SIGKILL terminates the worker first. Under direct `node` execution
-//      (without PM2), this safety net is the only guard against
-//      indefinite hang.
+//      logs a forced-shutdown error and exits. The exit code in this
+//      branch is `Math.max(intendedExitCode, 1)` — drain-timeout is
+//      always a failure mode (so the minimum exit code is 1), but if
+//      the original termination was already a fatal failure (code 1+),
+//      we preserve that code. The 10-second window is longer than PM2's
+//      default `kill_timeout: 5000` ms, so under PM2 management this
+//      safety net is rarely reached — PM2's SIGKILL terminates the
+//      worker first. Under direct `node` execution (without PM2), this
+//      safety net is the only guard against indefinite hang.
 //
 // The `setTimeout(...).unref()` call deserves explanation:
 //   - `setTimeout(fn, ms)` returns a Timer object that, by default, keeps
 //     the Node.js event loop alive (preventing the process from exiting
 //     while the timer is pending).
 //   - We CALL `.unref()` on the timer to detach it from the event loop:
-//     once `server.close(cb)` invokes its callback and `process.exit(0)`
+//     once `server.close(cb)` invokes its callback and `process.exit(...)`
 //     runs, the timer is no longer needed. If `.unref()` were omitted,
 //     the event loop would stay alive until the timer fires (or until
 //     the process exits) — which causes a 10-second hang on clean
@@ -564,7 +683,21 @@ const server = app.listen(config.port, config.host, () => {
 
 let isShuttingDown = false;
 
-function gracefulShutdown(signal) {
+// `gracefulShutdown` accepts two parameters: the `signal` name (string,
+// e.g., 'SIGINT', 'SIGTERM', 'uncaughtException', 'unhandledRejection')
+// for logging, and an `exitCode` (number) the process should exit with on
+// a clean drain. We do NOT use an ES2015 default parameter value
+// (e.g., `exitCode = 0`) here because:
+//   - Default values reduce `Function.prototype.length`, which is
+//     irrelevant for non-Express functions like this one but inconsistent
+//     with the pattern observed across the middleware files.
+//   - Explicit, non-ambiguous parameter shape: every caller passes both
+//     arguments so the intent is locally readable.
+//
+// All call sites pass both arguments explicitly (see signal-handler
+// registrations below).
+
+function gracefulShutdown(signal, exitCode) {
   // --- Step 1: re-entry guard ---------------------------------------------
   //
   // Without this guard, a double-signal (e.g., two Ctrl+C's in rapid
@@ -580,19 +713,48 @@ function gracefulShutdown(signal) {
   }
   isShuttingDown = true;
 
+  // Determine whether this shutdown is intentional (exit 0) or fatal
+  // (non-zero). Used below to select log severity and to compute the
+  // drain-timeout exit code. We treat any non-zero, non-undefined,
+  // non-null value as "fatal"; if a caller forgot to pass exitCode
+  // (legacy code path that should no longer exist), we default
+  // defensively to 0 (intentional) to preserve historical semantics.
+  const resolvedExitCode = typeof exitCode === 'number' ? exitCode : 0;
+  const isFatal = resolvedExitCode !== 0;
+
   // --- Step 2: log signal receipt ------------------------------------------
   //
-  // The signal name is included in the log message so operators can
-  // distinguish operator-initiated shutdowns (SIGINT from Ctrl+C) from
-  // process-manager-initiated shutdowns (SIGTERM from PM2 reload) when
-  // reviewing post-mortem logs. We also pass `signal` and `pid` in the
-  // structured metadata so a log aggregator can filter/group by these
-  // fields without parsing the message text.
+  // Severity selection (per the Checkpoint 2 FINAL MAJOR finding):
+  //   - Intentional signals (SIGINT/SIGTERM, exitCode === 0) are logged at
+  //     `info` severity — they're a normal operational event observed in
+  //     dashboards, not paged on-call.
+  //   - Fatal failures (uncaughtException/unhandledRejection, exitCode !== 0)
+  //     are logged at `error` severity — they indicate a serious bug that
+  //     should trigger alerting. The fatal handlers above ALSO log the
+  //     underlying exception/rejection details at `error` severity before
+  //     calling gracefulShutdown; this entry adds the drain-initiation
+  //     context (signal name, target exit code, pid) for log-aggregator
+  //     correlation.
+  //
+  // Structured metadata captures `signal`, the target `exitCode`, and the
+  // worker `pid` so log aggregators can filter and group entries by these
+  // fields without parsing the message text. The `pid` field is
+  // particularly valuable in PM2 cluster mode where every worker shares
+  // the same service name but has a distinct process id.
 
-  logger.info(`${signal} received; initiating graceful shutdown`, {
-    signal,
-    pid: process.pid
-  });
+  if (isFatal) {
+    logger.error(`${signal} received; initiating fatal-shutdown drain`, {
+      signal,
+      exitCode: resolvedExitCode,
+      pid: process.pid
+    });
+  } else {
+    logger.info(`${signal} received; initiating graceful shutdown`, {
+      signal,
+      exitCode: resolvedExitCode,
+      pid: process.pid
+    });
+  }
 
   // --- Step 3-5: close the HTTP server and exit ----------------------------
   //
@@ -607,20 +769,34 @@ function gracefulShutdown(signal) {
   // and unref'ing it could destabilize the cluster's socket bookkeeping.
   // Letting `server.close` complete naturally is the correct shutdown
   // semantic.
+  //
+  // Exit-code policy on the close callback (Checkpoint 2 FINAL MAJOR fix):
+  //   - `err` argument set (drain-state error) -> always exit 1.
+  //     Rationale: a drain-state failure is itself an abnormal condition
+  //     regardless of what triggered the shutdown.
+  //   - `err` argument unset (clean drain) -> exit with `resolvedExitCode`.
+  //     For intentional signals this is 0 (PM2/supervisors see a planned
+  //     stop); for fatal failures this is 1 (PM2/supervisors see a crash).
 
   server.close((err) => {
     if (err) {
       logger.error('Error during server.close()', {
         error: err && err.message,
-        stack: err && err.stack
+        stack: err && err.stack,
+        signal,
+        intendedExitCode: resolvedExitCode
       });
       // eslint-disable-next-line n/no-process-exit -- intentional shutdown
       process.exit(1);
       return;
     }
-    logger.info('HTTP server closed; exiting process');
+    logger.info('HTTP server closed; exiting process', {
+      signal,
+      exitCode: resolvedExitCode,
+      pid: process.pid
+    });
     // eslint-disable-next-line n/no-process-exit -- intentional shutdown
-    process.exit(0);
+    process.exit(resolvedExitCode);
   });
 
   // --- Step 6: drain-timeout safety net ------------------------------------
@@ -636,36 +812,57 @@ function gracefulShutdown(signal) {
   // effectively a fallback for the edge case where PM2 itself is not
   // managing the process (direct `node server.js`) or PM2 has crashed.
   //
+  // Exit-code policy on drain timeout:
+  //   - A drain-timeout is ALWAYS an abnormal condition (the server
+  //     failed to gracefully close in the allotted window), so the
+  //     minimum exit code is 1.
+  //   - If the original shutdown was already fatal (resolvedExitCode >= 1),
+  //     we preserve that code so the supervisor still sees the original
+  //     crash class.
+  //   - Therefore: `Math.max(resolvedExitCode, 1)`.
+  //
   // `.unref()` is critical (see header comment) — it lets the process
   // exit cleanly if `server.close` finishes before the timer fires.
 
   setTimeout(() => {
+    const timeoutExitCode = Math.max(resolvedExitCode, 1);
     logger.error('Forced shutdown after drain timeout', {
       timeoutMs: 10000,
       signal,
+      intendedExitCode: resolvedExitCode,
+      forcedExitCode: timeoutExitCode,
       pid: process.pid
     });
     // eslint-disable-next-line n/no-process-exit -- intentional shutdown
-    process.exit(1);
+    process.exit(timeoutExitCode);
   }, 10000).unref();
 }
 
 // --- Register signal handlers ------------------------------------------------
 //
-// Wrap `gracefulShutdown` in an arrow function so the signal name is
-// captured and passed in. Node delivers the signal name as the first
-// argument to the handler, so we could equivalently write
-// `process.on('SIGINT', gracefulShutdown)` — but the explicit arrow
-// makes the call shape obvious and aligns with the agent prompt's
-// Phase 6 reference shutdown handler skeleton.
+// Wrap `gracefulShutdown` in an arrow function so the signal name AND the
+// intended exit code can be captured and passed in. Node delivers the
+// signal name as the first argument to the handler, so we could write
+// `process.on('SIGINT', gracefulShutdown)` for the bare-signal case — but
+// the explicit arrow makes the call shape obvious AND lets us pass the
+// intended exit code (0 for intentional signals) without leaking that
+// concern into `gracefulShutdown`'s argument list when Node invokes it
+// directly.
 //
 // `process.on('SIGINT', ...)` overrides Node.js's default SIGINT
 // behavior (which is to print '^C' and exit). The override is intentional:
 // we want the graceful shutdown sequence to run instead of an immediate
 // exit.
+//
+// Exit-code semantics (Checkpoint 2 FINAL MAJOR fix):
+//   - SIGINT and SIGTERM are INTENTIONAL terminations initiated by an
+//     operator (Ctrl+C) or a process supervisor (PM2 stop / reload,
+//     systemd, Docker, Kubernetes). They MUST exit with code 0 on clean
+//     drain so PM2 and other supervisors classify them as planned stops
+//     in their status displays and restart-count accounting.
 
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT', 0));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM', 0));
 
 // =============================================================================
 // 8. Process-Level Safety Nets (Defensive)
@@ -691,11 +888,15 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 //   - Log the failure at `error` severity with full diagnostic metadata
 //     (message and stack) so post-mortem analysis has the original
 //     context.
-//   - Trigger `gracefulShutdown` to drain the HTTP server before exiting.
-//     A crashed worker that exits without draining drops in-flight
-//     requests — these requests fail with a connection-reset error on
-//     the client side. Triggering graceful shutdown gives the existing
-//     requests a chance to complete before the process exits.
+//   - Trigger `gracefulShutdown(signal, 1)` to drain the HTTP server
+//     before exiting with a NON-ZERO exit code (Checkpoint 2 FINAL MAJOR
+//     finding). A crashed worker that exits without draining drops
+//     in-flight requests — these requests fail with a connection-reset
+//     error on the client side. Triggering graceful shutdown gives the
+//     existing requests a chance to complete before the process exits.
+//     Passing exitCode=1 is essential so PM2 and other process supervisors
+//     classify the termination as a crash (not a planned stop) for
+//     restart-count accounting, status displays, and alerting.
 //
 // Why these are "safety nets" rather than primary error handlers:
 //   - The Express `errorHandler` middleware is the PRIMARY error handler
@@ -706,12 +907,23 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 //     issue in a third-party library); the log entry should be treated
 //     as an actionable alert.
 //
+// Exit-code policy (Checkpoint 2 FINAL MAJOR finding):
+//   - Previously, BOTH signal handlers and these fatal handlers called
+//     `gracefulShutdown(signal)` and the shutdown function unconditionally
+//     exited with code 0 on clean drain. PM2 saw fatal crashes as
+//     successful exits — masking restart accounting and operational
+//     visibility into worker failures. The fix: signal handlers pass
+//     exitCode=0, fatal handlers pass exitCode=1. `gracefulShutdown`
+//     threads the chosen code into `process.exit(...)` on clean drain
+//     and into the drain-timeout `process.exit(...)` via `Math.max(...)`.
+//
 // Caveats:
 //   - After `uncaughtException`, Node's documentation warns that the
 //     process state may be corrupt. The recommended pattern is to LOG
 //     the error and EXIT — DO NOT attempt to keep running. Our
-//     `gracefulShutdown` calls `process.exit(0)` (or 1 on error), which
-//     honors this recommendation.
+//     `gracefulShutdown` calls `process.exit(1)` (per the exitCode we
+//     pass below) which honors this recommendation while also draining
+//     in-flight HTTP requests.
 //   - For `unhandledRejection`, the `reason` may be anything (not
 //     necessarily an Error). We convert it via `String(reason)` so the
 //     log entry never throws even for exotic rejection values like
@@ -723,7 +935,10 @@ process.on('uncaughtException', (err) => {
     stack: err && err.stack,
     name: err && err.name
   });
-  gracefulShutdown('uncaughtException');
+  // Fatal failure -> exit code 1 (per Checkpoint 2 FINAL MAJOR finding).
+  // PM2 and other supervisors interpret non-zero exit codes as crashes,
+  // incrementing restart counters and triggering alert escalations.
+  gracefulShutdown('uncaughtException', 1);
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -735,7 +950,10 @@ process.on('unhandledRejection', (reason) => {
     stack: reason && reason.stack,
     name: reason && reason.name
   });
-  gracefulShutdown('unhandledRejection');
+  // Fatal failure -> exit code 1 (per Checkpoint 2 FINAL MAJOR finding).
+  // PM2 and other supervisors interpret non-zero exit codes as crashes,
+  // incrementing restart counters and triggering alert escalations.
+  gracefulShutdown('unhandledRejection', 1);
 });
 
 // =============================================================================

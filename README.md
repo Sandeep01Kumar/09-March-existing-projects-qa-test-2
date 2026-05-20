@@ -131,9 +131,10 @@ Expected output: a 14-byte body terminating with `0x0A` (the trailing newline). 
 │   ├── index.js              # Centralized configuration loader (reads process.env)
 │   └── logger.js             # Winston logger factory (JSON format, file transports)
 ├── middleware/
-│   ├── requestLogger.js      # Morgan HTTP request logger streamed into Winston
-│   ├── errorHandler.js       # Four-argument Express error handler
-│   └── notFoundHandler.js    # 404 handler for unmatched paths
+│   ├── requestLogger.js          # Morgan HTTP request logger streamed into Winston
+│   ├── errorHandler.js           # Four-argument Express error handler
+│   ├── notFoundHandler.js        # 404 handler for unmatched paths
+│   └── bodyParserErrorHandler.js # Compatibility shim: rewrites body-parser failures to the byte-exact 200 response
 ├── routes/
 │   └── index.js              # Express router (catch-all returning `Hello, World!\n`)
 ├── logs/                     # Runtime log files (gitignored; .gitkeep tracked)
